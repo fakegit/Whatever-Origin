@@ -3,17 +3,16 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/honeycombio/libhoney-go"
 )
-
-const RATE_LIMIT = 600
 
 type Status struct {
 	URL  string `json:"url"`
@@ -28,170 +27,168 @@ type Response struct {
 
 var client *http.Client
 var limiter sync.Map
-
-var getLogger *libhoney.Client
-
-var bypass = "Fly-Client-Ip"
+var rateLimit int
+var originRateLimit int
 
 func init() {
-	var err error
-
 	client = &http.Client{}
-
-	key := os.Getenv("HONEY")
-
-	bypassKey := os.Getenv("BYPASS")
-
-	if bypassKey != "" {
-		bypass = bypassKey
-	}
-
-	getLogger, err = libhoney.NewClient(libhoney.ClientConfig{
-		APIKey:  key,
-		Dataset: "whatever-tunnel",
-	})
-
-	if err != nil {
-		panic(err)
-	}
-
-	commit, err := ioutil.ReadFile(".git/refs/heads/master")
-
-	if err != nil {
-		panic(err)
-	}
-
-	getLogger.AddField("git", strings.TrimSpace(string(commit)))
-}
-
-func CORS(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		writer.Header().Set("Access-Control-Allow-Origin", "*")
-		writer.Header().Set("Allow", "*")
-		writer.Header().Set("Access-Control-Allow-Methods", "POST, GET, PUT, DELETE, OPTIONS")
-		writer.Header().Set("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Referer, User-Agent")
-
-		next.ServeHTTP(writer, request)
-	})
-}
-
-func tunnel(URL string, event *libhoney.Event) Response {
-	event.AddField("origin", URL)
-
-	request, err := http.NewRequest("GET", URL, nil)
-
-	if err != nil {
-		event.AddField("error", "invalid request")
-		event.AddField("error_raw", err)
-
-		return Response{
-			Status: Status{
-				URL:  URL,
-				Code: 500,
-			},
+	limiter = sync.Map{}
+	rateLimit = 30
+	if os.Getenv("RATE_LIMIT") != "" {
+		var err error
+		rateLimit, err = strconv.Atoi(os.Getenv("RATE_LIMIT"))
+		if err != nil {
+			panic("Invalid RATE_LIMIT value")
 		}
+	}
+	originRateLimit = 0
+	if os.Getenv("ORIGIN_RATE_LIMIT") != "" {
+		var err error
+		originRateLimit, err = strconv.Atoi(os.Getenv("ORIGIN_RATE_LIMIT"))
+		if err != nil {
+			panic("Invalid ORIGIN_RATE_LIMIT value")
+		}
+	}
+}
+
+func tunnel(URL string) (Response, error) {
+	request, err := http.NewRequest("GET", URL, nil)
+	if err != nil {
+		return Response{}, err
 	}
 
 	response, err := client.Do(request)
-
 	if err != nil {
-		event.AddField("error", "request failed")
-		event.AddField("error_raw", err)
-
-		return Response{
-			Status: Status{
-				URL:  URL,
-				Code: 500,
-			},
-		}
+		return Response{}, err
 	}
 
-	plain, err := ioutil.ReadAll(response.Body)
-
+	plain, err := io.ReadAll(response.Body)
 	if err != nil {
-		event.AddField("error", "failed to read body")
-		event.AddField("error_raw", err)
-
-		return Response{
-			Status: Status{
-				URL:  URL,
-				Code: 500,
-			},
-		}
+		return Response{}, err
 	}
 
-	result := Response{
+	return Response{
 		Content: string(plain),
 		Status: Status{
 			URL:  URL,
 			Type: response.Header.Get("Content-Type"),
 			Code: response.StatusCode,
 		},
-	}
-
-	event.AddField("content", result.Content)
-	event.AddField("status_url", result.Status.URL)
-	event.AddField("status_type", result.Status.Type)
-	event.AddField("status_code", result.Status.Code)
-
-	return result
+	}, nil
 }
 
-func check(address string) bool {
-	var value int
+func isLocalOrigin(origin string) bool {
+	if origin == "" {
+		return false
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
 
-	count, _ := limiter.LoadOrStore(address, &value)
+	hostname := u.Hostname()
 
+	localHostnames := []string{"localhost", "127.0.0.1", "0.0.0.0"}
+	for _, lh := range localHostnames {
+		if hostname == lh {
+			return true
+		}
+	}
+
+	return strings.HasPrefix(hostname, "192.168.")
+}
+
+func checkRateLimit(IP string, origin string) bool {
+	if originRateLimit > 0 && !isLocalOrigin(origin) {
+		count, _ := limiter.LoadOrStore(origin, new(int))
+		*count.(*int) += 1
+		return *count.(*int) < originRateLimit
+	}
+
+	count, _ := limiter.LoadOrStore(IP, new(int))
 	*count.(*int) += 1
+	return *count.(*int) < rateLimit
+}
 
-	return *count.(*int) < RATE_LIMIT
+func getIP(request *http.Request) string {
+	clientIPHeader := os.Getenv("CLIENT_IP_HEADER")
+	if clientIPHeader != "" {
+		return request.Header.Get(clientIPHeader)
+	}
+
+	ip, _, err := net.SplitHostPort(request.RemoteAddr)
+	if err == nil {
+		return ip
+	}
+
+	return request.RemoteAddr
 }
 
 func get(writer http.ResponseWriter, request *http.Request) {
-	event := getLogger.NewEvent()
-	defer event.Send()
-
-	start := time.Now()
-
-	defer func(event *libhoney.Event) {
-		event.AddField("duration", time.Since(start).Milliseconds())
-	}(event)
+	if request.Method == "OPTIONS" {
+		writer.Header().Set("Access-Control-Allow-Origin", "*")
+		writer.Header().Set("Access-Control-Allow-Methods", "GET")
+		writer.Header().Set("Access-Control-Allow-Headers", "*")
+		writer.WriteHeader(http.StatusNoContent)
+		return
+	} else if request.Method != "GET" {
+		writer.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
 
 	URL := request.URL.Query().Get("url")
-	IP := request.Header.Get(bypass)
+	callback := request.URL.Query().Get("callback")
 
-	event.AddField("url", URL)
-	event.AddField("ip", IP)
+	IP := getIP(request)
+	origin := request.Header.Get("Origin")
+	referer := request.Header.Get("Referer")
 
 	if URL == "" {
-		event.AddField("error", "failed to find parameter")
-
+		writer.WriteHeader(http.StatusBadRequest)
 		writer.Write([]byte("URL parameter is required."))
 		return
 	}
 
-	callback := request.URL.Query().Get("callback")
+	if callback != "" {
+		if referer == "" {
+			writer.WriteHeader(http.StatusBadRequest)
+			writer.Write([]byte("Referer header is required for JSONP callback requests."))
+			return
+		}
 
-	allowed := check(IP)
-
-	if allowed == false {
-		event.AddField("error", "rate limited")
-
-		writer.Write([]byte(fmt.Sprintf("rate limited: you have a max of %d request per second", RATE_LIMIT)))
+	} else if origin == "" {
+		writer.WriteHeader(http.StatusBadRequest)
+		writer.Write([]byte("Origin header is required for cross origin requests."))
 		return
 	}
 
-	body, _ := json.Marshal(tunnel(URL, event))
+	if !checkRateLimit(IP, origin) {
+		rateLimitValue := rateLimit
+		if originRateLimit > 0 && !isLocalOrigin(origin) {
+			rateLimitValue = originRateLimit
+		}
+		writer.WriteHeader(http.StatusTooManyRequests)
+		writer.Write([]byte(fmt.Sprintf("rate limited: limit %d request (s) per minute", rateLimitValue)))
+		return
+	}
+
+	response, err := tunnel(URL)
+	if err != nil {
+		writer.WriteHeader(http.StatusInternalServerError)
+		writer.Write([]byte("Error while processing the request."))
+		return
+	}
+	body, _ := json.Marshal(response)
 
 	if callback != "" {
-		event.AddField("callback", callback)
-
-		writer.Header().Set("Content-Type", "application/x-javascript")
+		writer.Header().Set("Content-Type", "text/javascript")
 		body = []byte(callback + "(" + string(body) + ")")
 	} else {
+		writer.Header().Set("Access-Control-Allow-Origin", "*")
 		writer.Header().Set("Content-Type", "application/json")
 	}
 
+	writer.Header().Set("Content-Length", strconv.Itoa(len(body)))
 	writer.Write(body)
 }
 
@@ -204,7 +201,7 @@ func main() {
 		}
 	}()
 
-	http.Handle("/get", CORS(http.HandlerFunc(get)))
+	http.Handle("/get", http.HandlerFunc(get))
 	http.Handle("/", http.FileServer(http.Dir("./static")))
 
 	panic(http.ListenAndServe(":8080", nil))
